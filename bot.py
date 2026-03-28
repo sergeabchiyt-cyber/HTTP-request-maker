@@ -7,6 +7,7 @@ import socket
 from typing import Any
 
 import httpx
+from aiohttp import web
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -286,11 +287,24 @@ def build_application() -> Application:
     return app
 
 
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+
 if __name__ == "__main__":
     application = build_application()
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
     async def main():
+        port = int(os.getenv("PORT", 8080))
+        aio_app = web.Application()
+        aio_app.router.add_get("/", health)
+        runner = web.AppRunner(aio_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"Health server listening on port {port}")
+
         async with application:
             await application.initialize()
             await application.updater.start_polling(
