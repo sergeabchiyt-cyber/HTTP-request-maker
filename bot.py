@@ -1,4 +1,3 @@
-```python
 import asyncio
 import ipaddress
 import json
@@ -288,4 +287,3 @@ if __name__ == "__main__":
     application = build_application()
     logger.info("Bot is running. Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-```
