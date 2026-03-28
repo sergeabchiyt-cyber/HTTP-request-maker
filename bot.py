@@ -1,5 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
 import asyncio
 import ipaddress
 import json
@@ -9,6 +7,7 @@ import socket
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -18,6 +17,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+
+load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -288,4 +289,15 @@ def build_application() -> Application:
 if __name__ == "__main__":
     application = build_application()
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    async def main():
+        async with application:
+            await application.initialize()
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+            await application.start()
+            await asyncio.Event().wait()
+
+    asyncio.run(main())
