@@ -46,6 +46,32 @@ REQUEST_TIMEOUT = 10.0
 MAX_RESPONSE_CHARS = 4000
 
 
+def split_text(text: str, max_chars: int = MAX_RESPONSE_CHARS) -> list[str]:
+    """Split text into chunks of max_chars, respecting code block formatting."""
+    if len(text) <= max_chars:
+        return [text]
+    
+    chunks = []
+    # Account for opening and closing code fences (```)
+    content_max = max_chars - 7  # 7 chars for "```\n\n\n```"
+    
+    while text:
+        if len(text) <= content_max:
+            chunks.append(text)
+            break
+        
+        # Find the last newline within the limit to avoid cutting mid-line
+        split_point = text.rfind('\n', 0, content_max)
+        if split_point == -1:
+            # No newline found, cut at max_chars
+            split_point = content_max
+        
+        chunks.append(text[:split_point])
+        text = text[split_point:].lstrip('\n')
+    
+    return chunks
+
+
 def is_ssrf_safe(url: str) -> tuple[bool, str]:
     try:
         from urllib.parse import urlparse
@@ -96,13 +122,6 @@ def parse_headers(raw: str) -> dict[str, str]:
         else:
             headers["x-api-key"] = line.strip()
     return headers
-
-
-def truncate(text: str, limit: int = MAX_RESPONSE_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    notice = f"\n\n... [truncated at {limit} chars]"
-    return text[: limit - len(notice)] + notice
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -238,10 +257,17 @@ async def execute_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     finally:
         context.user_data.clear()
 
-    await update.message.reply_text(
-        f"```\n{truncate(raw_output)}\n```",
-        parse_mode="Markdown",
-    )
+    # Split output into chunks if it exceeds the limit
+    chunks = split_text(raw_output, MAX_RESPONSE_CHARS)
+    total_chunks = len(chunks)
+    
+    for i, chunk in enumerate(chunks, start=1):
+        suffix = f"\n\n_({i}/{total_chunks})_" if total_chunks > 1 else ""
+        await update.message.reply_text(
+            f"```\n{chunk}\n```{suffix}",
+            parse_mode="Markdown",
+        )
+    
     return ConversationHandler.END
 
 
