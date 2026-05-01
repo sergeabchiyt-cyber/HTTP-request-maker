@@ -1,9 +1,11 @@
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 import socket
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -20,16 +22,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Proxy API", version="1.0.0")
-
-# CORS (optional, useful if you call this from a browser frontend)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # --- Config ---
 BLOCKED_NETWORKS = [
@@ -48,7 +40,7 @@ ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 REQUEST_TIMEOUT = 10.0
 
 
-# --- Rate limiter (in-memory; see note below about Vercel serverless) ---
+# --- Rate limiter (works properly on Render since container is persistent) ---
 class RateLimiter:
     def __init__(self, max_requests: int = 20, window_seconds: int = 60):
         self.max_requests = max_requests
@@ -58,7 +50,6 @@ class RateLimiter:
     def is_allowed(self, key: str) -> bool:
         now = time.time()
         timestamps = self._store.get(key, [])
-        # Keep only timestamps inside the sliding window
         timestamps = [t for t in timestamps if now - t < self.window]
 
         if len(timestamps) >= self.max_requests:
@@ -81,7 +72,7 @@ class ProxyRequest(BaseModel):
     body: Any = Field(default=None)
 
 
-# --- SSRF Guard (sync, wrapped in thread for async caller) ---
+# --- SSRF Guard ---
 def is_ssrf_safe(url: str) -> tuple[bool, str]:
     try:
         from urllib.parse import urlparse
@@ -120,10 +111,27 @@ def is_ssrf_safe(url: str) -> tuple[bool, str]:
         return False, f"URL validation error: {exc}"
 
 
-# --- Routes ---
+# --- App ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Proxy API starting up...")
+    yield
+    logger.info("Proxy API shutting down...")
+
+
+app = FastAPI(title="Proxy API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 @app.get("/")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "region": os.getenv("RENDER_REGION", "unknown")}
 
 
 @app.post("/")
@@ -158,7 +166,6 @@ async def proxy(request: Request, payload: ProxyRequest):
                 "url": payload.url,
                 "headers": payload.headers,
             }
-            # Only attach JSON body for methods that typically use one
             if payload.body is not None and method not in ("GET", "HEAD", "OPTIONS", "DELETE"):
                 req_kwargs["json"] = payload.body
 
@@ -189,3 +196,9 @@ async def proxy(request: Request, payload: ProxyRequest):
             "body": body_out,
         },
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
