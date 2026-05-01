@@ -1,23 +1,17 @@
 import asyncio
 import ipaddress
-import json
 import logging
 import os
 import socket
+import time
 from typing import Any
 
 import httpx
-from aiohttp import web
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -27,8 +21,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-URL, METHOD, AUTH, BODY = range(4)
+app = FastAPI(title="Proxy API", version="1.0.0")
 
+# CORS (optional, useful if you call this from a browser frontend)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Config ---
 BLOCKED_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
@@ -43,35 +46,42 @@ BLOCKED_NETWORKS = [
 
 ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 REQUEST_TIMEOUT = 10.0
-MAX_RESPONSE_CHARS = 4000
 
 
-def split_text(text: str, max_chars: int = MAX_RESPONSE_CHARS) -> list[str]:
-    """Split text into chunks of max_chars, respecting code block formatting."""
-    if len(text) <= max_chars:
-        return [text]
-    
-    chunks = []
-    # Account for opening and closing code fences (```)
-    content_max = max_chars - 7  # 7 chars for "```\n\n\n```"
-    
-    while text:
-        if len(text) <= content_max:
-            chunks.append(text)
-            break
-        
-        # Find the last newline within the limit to avoid cutting mid-line
-        split_point = text.rfind('\n', 0, content_max)
-        if split_point == -1:
-            # No newline found, cut at max_chars
-            split_point = content_max
-        
-        chunks.append(text[:split_point])
-        text = text[split_point:].lstrip('\n')
-    
-    return chunks
+# --- Rate limiter (in-memory; see note below about Vercel serverless) ---
+class RateLimiter:
+    def __init__(self, max_requests: int = 20, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self._store: dict[str, list[float]] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        timestamps = self._store.get(key, [])
+        # Keep only timestamps inside the sliding window
+        timestamps = [t for t in timestamps if now - t < self.window]
+
+        if len(timestamps) >= self.max_requests:
+            self._store[key] = timestamps
+            return False
+
+        timestamps.append(now)
+        self._store[key] = timestamps
+        return True
 
 
+rate_limiter = RateLimiter(max_requests=20, window_seconds=60)
+
+
+# --- Models ---
+class ProxyRequest(BaseModel):
+    url: str
+    method: str = "GET"
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: Any = Field(default=None)
+
+
+# --- SSRF Guard (sync, wrapped in thread for async caller) ---
 def is_ssrf_safe(url: str) -> tuple[bool, str]:
     try:
         from urllib.parse import urlparse
@@ -110,234 +120,72 @@ def is_ssrf_safe(url: str) -> tuple[bool, str]:
         return False, f"URL validation error: {exc}"
 
 
-def parse_headers(raw: str) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    for line in raw.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if ":" in line:
-            key, _, value = line.partition(":")
-            headers[key.strip()] = value.strip()
-        else:
-            headers["x-api-key"] = line.strip()
-    return headers
+# --- Routes ---
+@app.get("/")
+async def health():
+    return {"status": "ok"}
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text(
-        "🔧 *API Request Builder*\n\n"
-        "Step 1/4 — Send me the full request URL.\n"
-        "Example: `https://api.example.com/v1/data`\n\n"
-        "Use /cancel at any time to abort.",
-        parse_mode="Markdown",
-    )
-    return URL
+@app.post("/")
+async def proxy(request: Request, payload: ProxyRequest):
+    # 1. Rate limiting by IP
+    client_ip = request.headers.get("x-forwarded-for")
+    if not client_ip:
+        client_ip = request.client.host if request.client and request.client.host else "unknown"
+    client_ip = client_ip.split(",")[0].strip()
 
+    if not rate_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded: 20 RPM")
 
-async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    url = update.message.text.strip()
-
-    safe, reason = is_ssrf_safe(url)
+    # 2. SSRF check
+    safe, reason = await asyncio.to_thread(is_ssrf_safe, payload.url)
     if not safe:
-        await update.message.reply_text(
-            f"🚫 *SSRF check failed*\n`{reason}`\n\nSend a different URL or /cancel.",
-            parse_mode="Markdown",
-        )
-        return URL
+        raise HTTPException(status_code=400, detail=f"SSRF check failed: {reason}")
 
-    context.user_data["url"] = url
-    method_list = " | ".join(ALLOWED_METHODS)
-    await update.message.reply_text(
-        f"✅ URL accepted.\n\nStep 2/4 — HTTP method?\n`{method_list}`",
-        parse_mode="Markdown",
-    )
-    return METHOD
-
-
-async def receive_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    method = update.message.text.strip().upper()
-
+    # 3. Method validation
+    method = payload.method.upper()
     if method not in ALLOWED_METHODS:
-        await update.message.reply_text(
-            f"❌ Invalid method `{method}`.\nChoose from: `{' | '.join(ALLOWED_METHODS)}`",
-            parse_mode="Markdown",
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid method. Allowed: {', '.join(sorted(ALLOWED_METHODS))}",
         )
-        return METHOD
 
-    context.user_data["method"] = method
-    await update.message.reply_text(
-        "Step 3/4 — Headers / API key (optional).\n\n"
-        "Format: `Header-Name: value` (one per line)\n"
-        "Or paste a bare API key → saved as `x-api-key`.\n\n"
-        "Send `none` to skip.",
-        parse_mode="Markdown",
-    )
-    return AUTH
-
-
-async def receive_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-    context.user_data["headers"] = {} if raw.lower() == "none" else parse_headers(raw)
-
-    method = context.user_data["method"]
-    if method in ("GET", "HEAD", "OPTIONS", "DELETE"):
-        await update.message.reply_text(
-            f"⚡ No body needed for `{method}`. Executing request…",
-            parse_mode="Markdown",
-        )
-        return await execute_request(update, context)
-
-    await update.message.reply_text(
-        "Step 4/4 — JSON body.\n\n"
-        "Paste a valid JSON object or send `none` to skip.",
-        parse_mode="Markdown",
-    )
-    return BODY
-
-
-async def receive_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-
-    if raw.lower() == "none":
-        context.user_data["body"] = None
-    else:
-        try:
-            context.user_data["body"] = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            await update.message.reply_text(
-                f"❌ *Invalid JSON*\n`{exc}`\n\nFix it and re-send, or /cancel.",
-                parse_mode="Markdown",
-            )
-            return BODY
-
-    await update.message.reply_text("⚡ Executing request…")
-    return await execute_request(update, context)
-
-
-async def execute_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    url: str = context.user_data["url"]
-    method: str = context.user_data["method"]
-    headers: dict[str, str] = context.user_data.get("headers", {})
-    body: Any = context.user_data.get("body")
-
+    # 4. Execute upstream request
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=False) as client:
-            response = await client.request(
-                method=method,
-                url=url,
-                headers=headers,
-                json=body,
-            )
+            req_kwargs = {
+                "method": method,
+                "url": payload.url,
+                "headers": payload.headers,
+            }
+            # Only attach JSON body for methods that typically use one
+            if payload.body is not None and method not in ("GET", "HEAD", "OPTIONS", "DELETE"):
+                req_kwargs["json"] = payload.body
 
-        resp_headers = "\n".join(f"  {k}: {v}" for k, v in response.headers.items())
-        try:
-            body_text = response.json()
-            body_out = json.dumps(body_text, indent=2, ensure_ascii=False)
-        except Exception:
-            body_out = response.text
-
-        raw_output = (
-            f"📡 Response\n"
-            f"Status : {response.status_code} {response.reason_phrase}\n"
-            f"Headers:\n{resp_headers}\n\n"
-            f"Body:\n{body_out}"
-        )
+            response = await client.request(**req_kwargs)
 
     except httpx.TimeoutException:
-        raw_output = f"⏱ Request timed out after {REQUEST_TIMEOUT}s. The endpoint did not respond."
+        raise HTTPException(status_code=504, detail=f"Request timed out after {REQUEST_TIMEOUT}s")
     except httpx.TooManyRedirects:
-        raw_output = "🔄 Request aborted: too many redirects detected."
+        raise HTTPException(status_code=400, detail="Too many redirects")
     except httpx.RequestError as exc:
-        raw_output = f"🔌 Network error: {type(exc).__name__}: {exc}"
+        raise HTTPException(status_code=502, detail=f"Network error: {type(exc).__name__}: {exc}")
     except Exception as exc:
-        logger.exception("Unexpected error during request execution")
-        raw_output = f"💥 Unexpected error: {type(exc).__name__}: {exc}"
-    finally:
-        context.user_data.clear()
+        logger.exception("Unexpected proxy error")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {type(exc).__name__}: {exc}")
 
-    # Split output into chunks if it exceeds the limit
-    chunks = split_text(raw_output, MAX_RESPONSE_CHARS)
-    total_chunks = len(chunks)
-    
-    for i, chunk in enumerate(chunks, start=1):
-        suffix = f"\n\n_({i}/{total_chunks})_" if total_chunks > 1 else ""
-        await update.message.reply_text(
-            f"```\n{chunk}\n```{suffix}",
-            parse_mode="Markdown",
-        )
-    
-    return ConversationHandler.END
+    # 5. Build response
+    try:
+        body_out = response.json()
+    except Exception:
+        body_out = response.text
 
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text(
-        "🛑 Request cancelled. All state cleared.\nUse /start to begin a new request."
-    )
-    return ConversationHandler.END
-
-
-async def fallback_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Unknown command. Use /start to begin or /cancel to abort an active session."
-    )
-
-
-def build_application() -> Application:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise EnvironmentError("TELEGRAM_BOT_TOKEN is not set in the environment.")
-
-    app = Application.builder().token(token).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url)],
-            METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_method)],
-            AUTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_auth)],
-            BODY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_body)],
+    return JSONResponse(
+        status_code=response.status_code,
+        content={
+            "status": response.status_code,
+            "reason": response.reason_phrase,
+            "headers": dict(response.headers),
+            "body": body_out,
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_user=True,
-        per_chat=True,
-        allow_reentry=True,
     )
-
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(MessageHandler(filters.COMMAND, fallback_unknown))
-
-    return app
-
-
-async def health(request: web.Request) -> web.Response:
-    return web.Response(text="OK")
-
-
-if __name__ == "__main__":
-    application = build_application()
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-
-    async def main():
-        port = int(os.getenv("PORT", 8080))
-        aio_app = web.Application()
-        aio_app.router.add_get("/", health)
-        runner = web.AppRunner(aio_app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        logger.info(f"Health server listening on port {port}")
-
-        async with application:
-            await application.initialize()
-            await application.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-            )
-            await application.start()
-            await asyncio.Event().wait()
-
-    asyncio.run(main())
