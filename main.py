@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ipaddress
 import json
 import logging
@@ -40,7 +41,7 @@ ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 REQUEST_TIMEOUT = 10.0
 
 
-# --- Rate limiter (works properly on Render since container is persistent) ---
+# --- Rate limiter ---
 class RateLimiter:
     def __init__(self, max_requests: int = 20, window_seconds: int = 60):
         self.max_requests = max_requests
@@ -182,10 +183,19 @@ async def proxy(request: Request, payload: ProxyRequest):
         raise HTTPException(status_code=500, detail=f"Unexpected error: {type(exc).__name__}: {exc}")
 
     # 5. Build response
-    try:
-        body_out = response.json()
-    except Exception:
-        body_out = response.text
+    content_type = response.headers.get("content-type", "")
+    is_binary = any(t in content_type for t in ("audio/", "video/", "image/", "application/octet-stream"))
+
+    if is_binary:
+        body_out = base64.b64encode(response.content).decode("ascii")
+        encoding = "base64"
+    else:
+        try:
+            body_out = response.json()
+            encoding = "json"
+        except Exception:
+            body_out = response.text
+            encoding = "text"
 
     return JSONResponse(
         status_code=response.status_code,
@@ -194,6 +204,7 @@ async def proxy(request: Request, payload: ProxyRequest):
             "reason": response.reason_phrase,
             "headers": dict(response.headers),
             "body": body_out,
+            "encoding": encoding,
         },
     )
 
