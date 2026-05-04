@@ -7,11 +7,11 @@ import os
 import socket
 import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -136,55 +136,99 @@ async def health():
 
 
 @app.post("/")
-async def proxy(request: Request, payload: ProxyRequest):
+async def proxy(
+    request: Request,
+    url: Optional[str] = Query(default=None),
+):
     # 1. Rate limiting by IP
     client_ip = request.headers.get("x-forwarded-for")
     if not client_ip:
         client_ip = request.client.host if request.client and request.client.host else "unknown"
     client_ip = client_ip.split(",")[0].strip()
+    logger.info("[proxy] client_ip=%s", client_ip)
 
     if not rate_limiter.is_allowed(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded: 20 RPM")
 
-    # 2. SSRF check
-    safe, reason = await asyncio.to_thread(is_ssrf_safe, payload.url)
+    content_type = request.headers.get("content-type", "")
+    is_multipart = "multipart/form-data" in content_type
+    logger.info("[proxy] content_type=%r is_multipart=%s", content_type, is_multipart)
+
+    # 2. Resolve target URL and method
+    if is_multipart:
+        target_url = url
+        if not target_url:
+            raise HTTPException(status_code=400, detail="Multipart requests must supply ?url= query param")
+        method = "POST"
+        payload = None
+        logger.info("[proxy] multipart mode target_url=%s", target_url)
+    else:
+        try:
+            raw = await request.body()
+            logger.info("[proxy] raw body length=%d", len(raw))
+            data = json.loads(raw)
+            payload = ProxyRequest(**data)
+        except Exception as exc:
+            logger.error("[proxy] failed to parse JSON body: %s", exc)
+            raise HTTPException(status_code=422, detail=f"Failed to parse JSON body: {exc}")
+        target_url = payload.url
+        method = payload.method.upper()
+        logger.info("[proxy] json mode target_url=%s method=%s", target_url, method)
+
+    # 3. SSRF check
+    logger.info("[proxy] running SSRF check for %s", target_url)
+    safe, reason = await asyncio.to_thread(is_ssrf_safe, target_url)
     if not safe:
+        logger.warning("[proxy] SSRF blocked: %s", reason)
         raise HTTPException(status_code=400, detail=f"SSRF check failed: {reason}")
 
-    # 3. Method validation
-    method = payload.method.upper()
+    # 4. Method validation
     if method not in ALLOWED_METHODS:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid method. Allowed: {', '.join(sorted(ALLOWED_METHODS))}",
         )
 
-    # 4. Execute upstream request
+    # 5. Execute upstream request
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=False) as client:
-            req_kwargs = {
-                "method": method,
-                "url": payload.url,
-                "headers": payload.headers,
-            }
-            if payload.body is not None and method not in ("GET", "HEAD", "OPTIONS", "DELETE"):
-                req_kwargs["json"] = payload.body
+            if is_multipart:
+                raw_body = await request.body()
+                logger.info("[proxy] forwarding multipart body bytes=%d", len(raw_body))
+                response = await client.post(
+                    target_url,
+                    content=raw_body,
+                    headers={"Content-Type": content_type},
+                )
+            else:
+                req_kwargs: dict = {
+                    "method": method,
+                    "url": target_url,
+                    "headers": payload.headers,
+                }
+                if payload.body is not None and method not in ("GET", "HEAD", "OPTIONS", "DELETE"):
+                    req_kwargs["json"] = payload.body
+                response = await client.request(**req_kwargs)
 
-            response = await client.request(**req_kwargs)
+        logger.info("[proxy] upstream response status=%d content_type=%s",
+                    response.status_code, response.headers.get("content-type", ""))
 
     except httpx.TimeoutException:
+        logger.error("[proxy] upstream timeout after %ss", REQUEST_TIMEOUT)
         raise HTTPException(status_code=504, detail=f"Request timed out after {REQUEST_TIMEOUT}s")
     except httpx.TooManyRedirects:
+        logger.error("[proxy] too many redirects")
         raise HTTPException(status_code=400, detail="Too many redirects")
     except httpx.RequestError as exc:
+        logger.error("[proxy] network error: %s %s", type(exc).__name__, exc)
         raise HTTPException(status_code=502, detail=f"Network error: {type(exc).__name__}: {exc}")
     except Exception as exc:
-        logger.exception("Unexpected proxy error")
+        logger.exception("[proxy] unexpected error")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {type(exc).__name__}: {exc}")
 
-    # 5. Build response
-    content_type = response.headers.get("content-type", "")
-    is_binary = any(t in content_type for t in ("audio/", "video/", "image/", "application/octet-stream"))
+    # 6. Build response
+    resp_content_type = response.headers.get("content-type", "")
+    is_binary = any(t in resp_content_type for t in ("audio/", "video/", "image/", "application/octet-stream"))
 
     if is_binary:
         body_out = base64.b64encode(response.content).decode("ascii")
@@ -196,6 +240,9 @@ async def proxy(request: Request, payload: ProxyRequest):
         except Exception:
             body_out = response.text
             encoding = "text"
+
+    logger.info("[proxy] response encoding=%s body_preview=%s", encoding,
+                str(body_out)[:200] if not is_binary else f"<binary {len(response.content)} bytes>")
 
     return JSONResponse(
         status_code=response.status_code,
